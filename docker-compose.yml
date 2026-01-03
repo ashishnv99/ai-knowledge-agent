@@ -1,0 +1,5 @@
+services:
+  rag-api:
+    build: ./rag_api
+    ports:
+      - "8000:8000"
