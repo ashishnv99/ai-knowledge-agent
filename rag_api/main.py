@@ -16,6 +16,9 @@ from db import (
     init_db,
 )
 
+from embeddings import embed_text, embed_texts
+
+
 # pgvector distance helpers (SQLAlchemy)
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import select
@@ -52,10 +55,8 @@ class SeedResponse(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    # Provide your own query vector if you want. Otherwise we generate a random one.
-    query_vector: Optional[List[float]] = None
+    query: str
     top_k: int = Field(default=5, ge=1, le=50)
-    # Optional: restrict search to a document
     document_id: Optional[int] = None
 
 
@@ -89,21 +90,25 @@ def _random_vector(dim: int) -> List[float]:
 @app.post("/debug/seed", response_model=SeedResponse)
 def debug_seed(req: SeedRequest, db: Session = Depends(get_db_session)) -> SeedResponse:
     """
-    Inserts a single Document and N chunks with random embeddings.
-    This proves: DB is writable + pgvector column works.
+    Inserts a single Document and N chunks with REAL local embeddings (SentenceTransformers).
+    This proves: ingestion-style embedding + DB insert works.
     """
-    if req.rng_seed is not None:
-        random.seed(req.rng_seed)
-
+    # Create document
     doc = Document(title=req.title, source="debug", content_type="text/plain")
     db.add(doc)
-    db.flush()  # get doc.id without committing
+    db.flush()  # get doc.id
 
-    chunk_ids: List[int] = []
+    # Build chunk texts
+    texts: List[str] = []
     for i in range(req.num_chunks):
-        text = f"{req.chunk_text_prefix} #{i}. It mentions topic {i % 3}."
-        emb = _random_vector(EMBEDDING_DIM)
+        texts.append(f"{req.chunk_text_prefix} #{i}. It mentions topic_{i % 3}.")
 
+    # Create embeddings in one batch (fast)
+    embs = embed_texts(texts)  # List[List[float]]
+
+    # Insert chunks
+    chunk_ids: List[int] = []
+    for i, (text, emb) in enumerate(zip(texts, embs)):
         chunk = Chunk(
             document_id=doc.id,
             chunk_index=i,
@@ -111,7 +116,6 @@ def debug_seed(req: SeedRequest, db: Session = Depends(get_db_session)) -> SeedR
             embedding=emb,
             chunk_metadata={"source": "debug", "topic": f"topic_{i % 3}"},
         )
-
         db.add(chunk)
         db.flush()
         chunk_ids.append(chunk.id)
@@ -124,20 +128,12 @@ def debug_seed(req: SeedRequest, db: Session = Depends(get_db_session)) -> SeedR
 @app.post("/debug/search", response_model=SearchResponse)
 def debug_search(req: SearchRequest, db: Session = Depends(get_db_session)) -> SearchResponse:
     """
-    Runs a vector similarity search over chunks.
-    This proves: retrieval works (ORDER BY vector distance).
+    Runs a vector similarity search using a REAL embedded query (SentenceTransformers).
+    This proves: query->embedding->pgvector search works.
     """
-    # Validate / generate query vector
-    if req.query_vector is None:
-        query_vec = _random_vector(EMBEDDING_DIM)
-    else:
-        query_vec = req.query_vector
-        if len(query_vec) != EMBEDDING_DIM:
-            raise ValueError(f"query_vector must have length {EMBEDDING_DIM}, got {len(query_vec)}")
+    query_vec = embed_text(req.query)
 
-    # Build query:
-    # Using cosine distance (<=>) for similarity. Lower is better.
-    # We'll convert to a "score" as (1 - distance) for display, but note it's not a strict cosine similarity.
+    # cosine distance (lower is better)
     distance = Chunk.embedding.cosine_distance(query_vec).label("distance")
 
     stmt = select(Chunk, distance)
@@ -151,7 +147,9 @@ def debug_search(req: SearchRequest, db: Session = Depends(get_db_session)) -> S
 
     hits: List[SearchHit] = []
     for chunk, dist in rows:
-        score = float(1.0 - dist)  # display-friendly; closer => higher score
+        # Display-friendly score. Not a strict cosine similarity, but higher is better.
+        score = float(1.0 - dist)
+
         hits.append(
             SearchHit(
                 chunk_id=chunk.id,
